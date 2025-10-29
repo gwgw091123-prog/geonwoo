@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>거창대성고 대학 추천 시뮬레이터 (업데이트: 등급별 보정)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .fade-enter { opacity: 0; transform: translateY(6px); }
+    .fade-enter-active { opacity: 1; transform: translateY(0); transition: all .22s ease; }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+  <div class="max-w-3xl mx-auto p-6" id="root"></div>
+
+<script>
+/*
+  변경 요약 (반영):
+  - 등급 입력 소수 허용(0.01 단위)
+  - 5등급 농어촌 보정 = 0.5등급 유리 (최소 1.00)
+  - 9등급 농어촌 보정 = 1.0등급 유리 (최소 1.00)
+  - 정규화: (grade - 1) / (max - 1) * 100 -> 5등급과 9등급이 같은 숫자라도 다른 정규화값을 가짐
+  - 추천은 정규화값을 기준으로 버킷화
+*/
+
+const root = document.getElementById('root');
+
+const state = {
+  step: 1,         // 1: choose, 2: input, 3: result
+  system: null,    // "5" or "9"
+  rawGrade: null,
+  adjustedGrade: null,
+  isRural: false,
+  recommendations: null,
+  universities: null
+};
+
+const SAMPLE_UNIS = [
+  {name:"서울대학교", rank:"top", majors:["수학과","물리학과","의예과"]},
+  {name:"고려대학교", rank:"reach", majors:["생명과학과","경영학부"]},
+  {name:"연세대학교", rank:"reach", majors:["정치외교학과","의예과"]},
+  {name:"성균관대학교", rank:"high", majors:["전기전자공학부","컴퓨터공학부"]},
+  {name:"한양대학교", rank:"high", majors:["기계공학부","건축학과"]},
+  {name:"중앙대학교", rank:"mid-high", majors:["미디어커뮤니케이션학과","경영학부"]},
+  {name:"경희대학교", rank:"mid-high", majors:["의예과(특성)","국제학부"]},
+  {name:"충북대학교", rank:"low-mid", majors:["간호학과","공간정보공학과"]},
+  {name:"강원대학교", rank:"low-mid", majors:["환경공학과","생명과학과"]},
+  {name:"계명대학교", rank:"local", majors:["경영학부","간호학과"]}
+];
+
+function render() {
+  if (state.step === 1) return renderChooseSystem();
+  if (state.step === 2) return renderInputPage();
+  if (state.step === 3) return renderResultPage();
+}
+
+// 첫 화면: 등급제 선택
+function renderChooseSystem() {
+  root.innerHTML = `
+    <div class="fade-enter fade-enter-active bg-white rounded-2xl p-6 shadow">
+      <h1 class="text-2xl font-bold mb-3">거창대성고 대학 추천 시뮬레이터</h1>
+      <p class="mb-4 text-sm text-gray-600">등급제를 선택하세요. (소수 입력 허용)</p>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+        <button id="choose5" class="p-4 rounded-lg border hover:shadow">5등급제 (1.00 ~ 5.00)</button>
+        <button id="choose9" class="p-4 rounded-lg border hover:shadow">9등급제 (1.00 ~ 9.00)</button>
+      </div>
+
+      <div class="text-xs text-gray-500">
+        중요: 농어촌 보정은 등급제별로 다릅니다. (5등급: 0.5등급 유리, 9등급: 1.0등급 유리)
+      </div>
+    </div>
+  `;
+  document.getElementById('choose5').onclick = () => { state.system = "5"; state.step = 2; render(); };
+  document.getElementById('choose9').onclick = () => { state.system = "9"; state.step = 2; render(); };
+}
+
+// 입력 페이지
+function renderInputPage() {
+  const max = state.system === "5" ? 5.00 : 9.00;
+  const placeholder = state.system === "5" ? "1.00 ~ 5.00 (소수 허용)" : "1.00 ~ 9.00 (소수 허용)";
+  root.innerHTML = `
+    <div class="bg-white rounded-2xl p-6 shadow">
+      <button id="back" class="text-sm text-slate-500 mb-3">← 뒤로</button>
+      <h2 class="text-xl font-semibold mb-2">등급 입력</h2>
+      <form id="inputForm" class="space-y-4">
+        <div>
+          <label class="block text-sm">등급제: <span class="font-medium">${state.system}등급제</span></label>
+        </div>
+
+        <div>
+          <label class="block text-sm">등급 입력 (${placeholder})</label>
+          <input id="gradeInput" type="number" min="1.00" max="${max}" step="0.01" placeholder="${placeholder}"
+            class="p-2 border rounded w-40" required />
+        </div>
+
+        <div>
+          <label class="inline-flex items-center">
+            <input id="rural" type="checkbox" class="mr-2"/>
+            <span class="text-sm">농어촌/특별전형 해당 (체크 시 등급제별 보정 적용)</span>
+          </label>
+        </div>
+
+        <div>
+          <button class="px-4 py-2 rounded bg-slate-100" type="submit">추천 보기</button>
+        </div>
+      </form>
+
+      <div class="mt-4 text-xs text-gray-500">
+        (예: 2.25 입력 가능) — 5등급과 9등급은 정규화 방식이 달라 같은 숫자라도 결과가 다릅니다.
+      </div>
+
+      <div id="dataStatus" class="text-xs text-gray-500 mt-2">데이터 상태: 로컬 샘플 사용(공공데이터 시도 중)</div>
+    </div>
+  `;
+
+  document.getElementById('back').onclick = () => { state.step = 1; render(); };
+
+  // 공공데이터 시도(실패 시 샘플)
+  loadPublicUniversityData().then(arr => {
+    if (arr && arr.length) {
+      state.universities = arr;
+      document.getElementById('dataStatus').textContent = `데이터 상태: 공공데이터 ${arr.length}건 로드 완료.`;
+    } else {
+      state.universities = SAMPLE_UNIS;
+      document.getElementById('dataStatus').textContent = '데이터 상태: 공공데이터 불가 — 내장 샘플 사용.';
+    }
+  }).catch(_=> {
+    state.universities = SAMPLE_UNIS;
+    document.getElementById('dataStatus').textContent = '데이터 상태: 공공데이터 불가 — 내장 샘플 사용.';
+  });
+
+  document.getElementById('inputForm').onsubmit = (ev) => {
+    ev.preventDefault();
+    const raw = parseFloat(document.getElementById('gradeInput').value);
+    const rural = document.getElementById('rural').checked;
+    const maxVal = state.system === "5" ? 5.00 : 9.00;
+    if (isNaN(raw) || raw < 1.0 || raw > maxVal) return alert(`등급은 ${state.system}등급제 범위 내 숫자(소수 허용)로 입력하세요.`);
+
+    // 등급제별 농어촌 보정 (사용자 요청 반영)
+    //  - 5등급제: 보정 = 0.5등급 유리
+    //  - 9등급제: 보정 = 1.0등급 유리 (기존 요청대로 최소 1등급 이득)
+    let adjusted = raw;
+    if (rural) {
+      if (state.system === "5") adjusted = Math.max(1.00, +(raw - 0.50).toFixed(2));
+      else adjusted = Math.max(1.00, +(raw - 1.00).toFixed(2));
+    }
+    state.rawGrade = +raw.toFixed(2);
+    state.adjustedGrade = +adjusted.toFixed(2);
+    state.isRural = rural;
+    state.recommendations = generateRecommendations(state.system, state.adjustedGrade, state.universities || SAMPLE_UNIS);
+    state.step = 3;
+    render();
+  };
+}
+
+// 결과 페이지
+function renderResultPage() {
+  const rec = state.recommendations;
+  root.innerHTML = `
+    <div class="bg-white rounded-2xl p-6 shadow">
+      <button id="back2" class="text-sm text-slate-500 mb-3">← 뒤로</button>
+      <h2 class="text-xl font-semibold mb-2">추천 결과</h2>
+      <div class="text-sm text-gray-600 mb-3">
+        선택한 등급제: <strong>${state.system}등급제</strong> |
+        입력 등급: <strong>${state.rawGrade.toFixed(2)}</strong> |
+        농어촌 보정 적용: <strong>${state.isRural ? '예 (보정 후 ' + state.adjustedGrade.toFixed(2) + '등급)' : '아니오'}</strong>
+      </div>
+
+      <div class="grid gap-4">
+        <div class="p-4 border rounded">
+          <div class="font-semibold">도전 (Ambitious)</div>
+          <div class="text-sm text-gray-700">${rec.ambitious.name}</div>
+          <div class="text-xs text-gray-500 mt-1">추천 학과: ${rec.ambitious.majors.join(', ')}</div>
+          <div class="text-xs text-gray-400 mt-2">권장 이유: ${rec.ambitious.reason}</div>
+        </div>
+
+        <div class="p-4 border rounded">
+          <div class="font-semibold">안정 (Safe)</div>
+          <div class="text-sm text-gray-700">${rec.safe.name}</div>
+          <div class="text-xs text-gray-500 mt-1">추천 학과: ${rec.safe.majors.join(', ')}</div>
+          <div class="text-xs text-gray-400 mt-2">권장 이유: ${rec.safe.reason}</div>
+        </div>
+
+        <div class="p-4 border rounded">
+          <div class="font-semibold">확실 (Likely)</div>
+          <div class="text-sm text-gray-700">${rec.likely.name}</div>
+          <div class="text-xs text-gray-500 mt-1">추천 학과: ${rec.likely.majors.join(', ')}</div>
+          <div class="text-xs text-gray-400 mt-2">권장 이유: ${rec.likely.reason}</div>
+        </div>
+      </div>
+
+      <div class="mt-4 flex gap-2">
+        <button id="downloadCsv" class="px-3 py-2 rounded bg-slate-100 text-sm">CSV로 저장</button>
+        <button id="newSearch" class="px-3 py-2 rounded bg-slate-100 text-sm">다시하기</button>
+      </div>
+
+      <div class="mt-4 text-xs text-gray-500">
+        <strong>주의:</strong> 추천은 내부 간소화 모델 및 (가능 시) 공공데이터를 조합해 도출합니다. 실제 지원 전 대학 전형요강을 반드시 확인하세요.
+      </div>
+    </div>
+  `;
+  document.getElementById('back2').onclick = () => { state.step = 2; render(); };
+  document.getElementById('newSearch').onclick = () => { state.step = 1; state.system = null; render(); };
+  document.getElementById('downloadCsv').onclick = () => {
+    downloadCSV([
+      ["등급제","입력등급","농어촌보정적용","보정후등급"],
+      [state.system, state.rawGrade.toFixed(2), state.isRural ? "예":"아니오", state.adjustedGrade.toFixed(2)]
+    ], 'recommend-input.csv');
+  };
+}
+
+// 추천 로직: 정규화는 등급제별로 분모가 달라 동일 숫자라도 다른 값 됨
+function generateRecommendations(system, adjustedGrade, universities) {
+  // 정규화: 0..100 (작을수록 좋음)
+  let norm;
+  if (system === "5") {
+    norm = ((adjustedGrade - 1.0) / (5.0 - 1.0)) * 100; // 분모 4.0
+  } else {
+    norm = ((adjustedGrade - 1.0) / (9.0 - 1.0)) * 100; // 분모 8.0
+  }
+  // 구간 설정 (직관적)
+  let ambitiousTarget, safeTarget, likelyTarget;
+  if (norm <= 15) {
+    ambitiousTarget = "top"; safeTarget = "reach"; likelyTarget = "high";
+  } else if (norm <= 35) {
+    ambitiousTarget = "reach"; safeTarget = "high"; likelyTarget = "mid-high";
+  } else if (norm <= 60) {
+    ambitiousTarget = "high"; safeTarget = "mid-high"; likelyTarget = "mid";
+  } else if (norm <= 85) {
+    ambitiousTarget = "mid-high"; safeTarget = "mid"; likelyTarget = "low-mid";
+  } else {
+    ambitiousTarget = "mid"; safeTarget = "low-mid"; likelyTarget = "local";
+  }
+
+  const bucketsByRank = {
+    top: ["서울대학교","연세대학교","고려대학교"],
+    reach: ["고려대학교","연세대학교","성균관대학교"],
+    high: ["성균관대학교","한양대학교","중앙대학교"],
+    "mid-high": ["중앙대학교","경희대학교","서강대학교"],
+    mid: ["성신여대","한국외대","서경대"],
+    "low-mid": ["충북대학교","강원대학교","지방거점국립대 예시"],
+    local: ["계명대학교","유사 지역대학","전문대학 예시"]
+  };
+
+  function pickFrom(unis, preferList) {
+    for (let name of preferList) {
+      const found = unis.find(u => u.name && u.name.indexOf(name) !== -1);
+      if (found) return found;
+    }
+    const byRank = unis.find(u => u.rank && Object.keys(bucketsByRank).includes(u.rank));
+    if (byRank) return byRank;
+    return unis[0] || {name:"데이터 없음", majors:["정보 없음"]};
+  }
+
+  const ambitious = pickFrom(universities, bucketsByRank[ambitiousTarget]);
+  const safe = pickFrom(universities, bucketsByRank[safeTarget]);
+  const likely = pickFrom(universities, bucketsByRank[likelyTarget]);
+
+  function reasonText(target) {
+    switch(target) {
+      case "top": return "입시 상위권 — 도전 가능한 대학을 추천합니다.";
+      case "reach": return "상위권 / 약간의 경쟁 필요 — 도전성 있는 선택입니다.";
+      case "high": return "안정적인 상위권 선택입니다.";
+      case "mid-high": return "중상위권 — 준비하면 가능성이 큽니다.";
+      case "mid": return "중위권 — 합격 가능성이 높은 안전권입니다.";
+      case "low-mid": return "지방거점 / 실무 중심 학과 추천.";
+      case "local": return "지역 대학 / 전문대학 — 실질 합격 가능성이 큽니다.";
+      default: return "추천 기준에 따라 선정된 학과입니다.";
+    }
+  }
+
+  return {
+    ambitious: { name: ambitious.name, majors: ambitious.majors || ["정보없음"], reason: reasonText(ambitiousTarget) },
+    safe:     { name: safe.name,     majors: safe.majors     || ["정보없음"], reason: reasonText(safeTarget) },
+    likely:   { name: likely.name,   majors: likely.majors   || ["정보없음"], reason: reasonText(likelyTarget) }
+  };
+}
+
+// CSV 다운로드
+function downloadCSV(rows, filename='data.csv') {
+  const csv = rows.map(r => r.map(item => `"${String(item).replace(/"/g,'""')}"`).join(',')).join('\n');
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 3000);
+}
+
+// 공공데이터 로드 시도(실패시 null 반환 -> 샘플 사용)
+async function loadPublicUniversityData() {
+  try {
+    // 브라우저에서 공개 데이터 직접 가져오려 시도하지만 CORS/API키 이슈로 실패할 가능성 큼.
+    // 운영 시: 서버 프록시 + API키로 안정화 필요.
+    const candidateUrls = [
+      'https://www.data.go.kr/data/15014632/download.do?filePath=../data_upload/20230614/20230614_univ_list.json',
+      'https://www.data.go.kr/data/15119002/fileData.do'
+    ];
+    for (let u of candidateUrls) {
+      try {
+        const resp = await fetch(u);
+        if (!resp.ok) continue;
+        const txt = await resp.text();
+        try {
+          const j = JSON.parse(txt);
+          if (Array.isArray(j) && j.length > 0) {
+            return j.map(item => ({
+              name: item.SCHOOL_NAME || item.schoolName || item.name || '대학명',
+              majors: item.MAJOR_NAME ? [item.MAJOR_NAME] : (item.학과명 ? [item.학과명] : ["학과정보없음"]),
+              rank: null
+            }));
+          }
+        } catch(_) {}
+      } catch(_) {}
+    }
+    return null;
+  } catch(e) {
+    return null;
+  }
+}
+
+// 초기 렌더
+render();
+</script>
+</body>
+</html>
